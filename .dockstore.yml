@@ -1,0 +1,6 @@
+# Tells Dockstore where the workflow is, so it can send it to Terra.
+version: 1.2
+workflows:
+  - name: slidetags_flex
+    subclass: WDL
+    primaryDescriptorPath: /slidetags_flex.wdl
