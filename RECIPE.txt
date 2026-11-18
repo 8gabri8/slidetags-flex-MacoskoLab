@@ -1,0 +1,120 @@
+FLEX + SLIDE-TAGS: RECIPE FOR A NEW DATASET
+===========================================
+
+Two Terra workflows, run one after the other, from the same sample sheet:
+  1. cellranger_workflow (Cumulus)  ->  Cell Ranger results (RNA)
+  2. slidetags_flex                 ->  positions of the nuclei + one summary per section
+
+
+0. ONE-TIME SETUP (already done)
+--------------------------------
+- GitHub repository with this code.
+- Docker image on Docker Hub (8gabri8/slidetags-flex:<tag>).
+- Workflow registered on Dockstore and imported into Terra.
+- Cumulus cellranger_workflow in the Terra workspace.
+If the code changes: update the files on GitHub, then rebuild the image
+(GitHub > Actions > Build Docker image > Run workflow, same tag).
+
+
+1. PUT THE FILES IN THE BUCKET
+------------------------------
+gs://<bucket>/
+  fastqs/<run>/                          ALL FASTQs of the run, directly in this folder:
+                                           GEX libraries      SI-TS-xx_S*_L00*_R1/R2_001.fastq.gz
+                                           spatial libraries  SI-TT-xx_S*_L00*_R1/R2_001.fastq.gz
+  recon/<run>/<puck>/<params>/Puck.csv   one reconstructed puck per section (already made by the
+                                         puck reconstruction; nothing to change)
+  flex/cumulus_cellranger_inputs/<experiment>/
+      <experiment>-flex_samples.csv          step 2
+      <experiment>-cumulus_sample_sheet.csv   step 3
+      <experiment>-terra_inputs.json         step 4
+  flex/outputs/<experiment>/             Cell Ranger results (made by workflow 1)
+  flex/outputs/<experiment>/flex_slidetag_out/   Slide-tags results (made by workflow 2)
+
+Pucks in another bucket: that bucket must give read access to your Terra proxy group
+(shown on your Terra profile page).
+
+
+2. THE FLEX SAMPLE FILE (one row per section = sample = puck)
+-------------------------------------------------------------
+sample_id,probe_barcode_ids,emptydrops_minimum_umis,description
+brain_section1,A-D04,100,coronal section 1 - regular puck
+brain_section2,A-E04,100,coronal section 2 - pre-hybridised puck
+
+- sample_id: the section name, used everywhere (pucks column, output folders).
+- probe_barcode_ids: the Flex barcode used on that section.
+- Only if the adapter tag of a section is NOT its Flex probe barcode: add a column spatial_tag
+  with the tag sequence (leave it empty for the others). If Cell Ranger refuses the extra
+  column, give Cell Ranger a copy without it.
+
+
+3. THE SAMPLE SHEET (one line per spatial library)
+--------------------------------------------------
+Your usual Cumulus sheet + 4 columns:
+
+Link,Sample,Reference,Flowcell,AuxFile,DataType,Chemistry,sb_index,pucks,cellranger_output_dir,slidetags_output_dir
+brain_GEMwell1,SI-TS-G1,GRCm39-2024-A,gs://.../fastqs/<run>,gs://.../<experiment>-flex_samples.csv,flex-v2,auto,SI-TT-A6,brain_section1=gs://.../Puck.csv;brain_section2=gs://.../Puck.csv,gs://.../flex/outputs/<experiment>,gs://.../flex/outputs/<experiment>/flex_slidetag_out
+brain_GEMwell2,SI-TS-G2,GRCm39-2024-A,(same),(same),flex-v2,auto,SI-TT-A7,(same),(same),(same)
+
+  Link                   GEM well name (one per GEM well)
+  Sample                 GEX library index (SI-TS-..)
+  Reference              GRCm39-2024-A (mouse) / GRCh38-2024-A (human)
+  Flowcell               the FASTQ folder
+  AuxFile                the Flex sample file (step 2)
+  DataType / Chemistry   flex-v2 / auto
+  sb_index               spatial library index (SI-TT-..); empty = this GEM well has no spatial library
+  pucks                  section=Puck.csv for every section, separated by ;
+  cellranger_output_dir  = the Cumulus output_directory (same on every line)
+  slidetags_output_dir   where Slide-tags writes (same on every line)
+
+Depending on the wet lab:
+- One GEM well, one GEX + one spatial library ........ 1 line.
+- Several GEM wells (more nuclei) .................... 1 line per GEM well (different Link and Sample).
+- Several sections pooled in a GEM well .............. nothing to add: sections come from the Flex
+                                                       sample file; list a puck for each in "pucks".
+- Two spatial libraries from the SAME GEM well ....... 2 lines with the same Link, different sb_index.
+                                                       Slide-tags pools them. Give Cumulus a copy of the
+                                                       sheet WITHOUT the extra line (it would be a
+                                                       duplicate GEX run).
+- GEM well with no spatial library ................... sb_index and pucks empty (RNA only).
+- Several sections on ONE puck ....................... give the same Puck.csv to each section.
+
+Edit the CSV in a text editor or Google Sheets. Excel with German settings saves ";" between
+columns and breaks the file.
+
+
+4. THE INPUTS JSON (one file for both workflows)
+------------------------------------------------
+Copy examples/Pilot_FFPE_092026/Pilot_FFPE_092026-terra_inputs.json and change:
+- both input_csv_file lines: path of the sample sheet
+- cellranger_workflow.output_directory: same as cellranger_output_dir in the sheet
+- slidetags_flex.docker: 8gabri8/slidetags-flex:<tag>
+Everything else can stay. Each workflow only uses the lines that start with its own name.
+
+
+5. RUN
+------
+a. Upload the 3 files of steps 2-4 to the bucket.
+b. Terra > Workflows > cellranger_workflow > Inputs > upload json > Save > Run analysis > Launch.
+   Wait until it has finished (results in cellranger_output_dir/<Link>/).
+c. Terra > Workflows > slidetags_flex > Inputs > upload json > Save > Run analysis > Launch.
+   Job History: list_lines, then one run_line per line, then one summarize per section.
+d. Results, in slidetags_output_dir:
+     summary/<section>/<section>_summary.pdf   the report (look at this first)
+     summary/<section>/coords.csv              every nucleus: position, score, status, RNA cluster, UMAP
+     summary/<section>/files.csv               paths of all files of the section (Cell Ranger matrices,
+                                               spatial results, puck, FASTQs)
+     summary/<section>/qc_per_library.csv      QC per GEM well x library
+     <Link>_<sb_index>/                        per-library results (used to build the summaries)
+e. To redo only the summaries: set slidetags_flex.only_summarize = true and launch again.
+
+
+CHECKLIST BEFORE LAUNCHING
+--------------------------
+[ ] Spatial FASTQs directly in the Flowcell folder:
+      gcloud storage ls "gs://<bucket>/fastqs/<run>/SI-TT-A6_*"
+[ ] Every sample_id of the Flex sample file has a puck in "pucks", with the same spelling.
+[ ] cellranger_output_dir (sheet) = cellranger_workflow.output_directory (JSON).
+[ ] input_csv_file (JSON) points to the sheet you uploaded.
+[ ] The CSV is comma-separated (open it in a text editor to check).
+[ ] Slide-tags launched only after Cell Ranger has finished.

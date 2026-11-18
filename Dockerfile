@@ -1,8 +1,9 @@
 # Image for the slidetags_flex Terra workflow:
-# Python 3.11 + numpy/pandas/scipy/matplotlib, gcloud (gs:// paths), pigz (fast .gz reading), slidetags_flex.py
+# Python 3.11 + numpy/pandas/scipy/matplotlib, scanpy + h5py (section summaries), gcloud (gs:// paths),
+# pigz (fast .gz reading), and the three scripts.
 #
-# Built automatically by .github/workflows/docker.yml (GitHub -> Docker Hub). Or with Google Cloud Build:
-#   gcloud builds submit --tag us-central1-docker.pkg.dev/<PROJECT>/<REPOSITORY>/slidetags-flex:v2.0.0 .
+# Built by .github/workflows/docker.yml (GitHub -> Docker Hub). Or with Google Cloud Build:
+#   gcloud builds submit --tag us-central1-docker.pkg.dev/<PROJECT>/<REPOSITORY>/slidetags-flex:v3.0.0 .
 FROM python:3.11-slim
 
 RUN apt-get update \
@@ -15,10 +16,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends google-cloud-cli \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir numpy==2.1.3 pandas==2.2.3 scipy==1.14.1 matplotlib==3.9.2
+# scanpy[leiden] brings anndata, umap-learn, igraph and leidenalg
+RUN pip install --no-cache-dir numpy==2.0.2 pandas==2.2.3 scipy==1.14.1 matplotlib==3.9.2 \
+      h5py==3.12.1 "scanpy[leiden]==1.10.4"
 
-COPY slidetags_flex.py /opt/slidetags_flex.py
-ENV PYTHONUNBUFFERED=1
+COPY slidetags_flex.py merge_sections.py report_section.py /opt/
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/opt NUMBA_CACHE_DIR=/tmp/numba MPLCONFIGDIR=/tmp/matplotlib
 
-# Smoke test at build time
-RUN python3 /opt/slidetags_flex.py --help > /dev/null
+# Checks at build time: the command line works, and scanpy (UMAP, Leiden) + the .h5 reader work
+# on a small made-up dataset. If one fails, the image is not built.
+RUN python3 /opt/slidetags_flex.py --help > /dev/null \
+ && python3 /opt/merge_sections.py --self-test

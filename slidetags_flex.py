@@ -12,17 +12,32 @@ The sample sheet is the one you run Cumulus (Cell Ranger) with, plus 4 columns:
     cellranger_output_dir  Cumulus output_directory (Cell Ranger results are in <this>/<Link>)
     slidetags_output_dir   results are written to <this>/<Link>_<sb_index>/
 It also uses Cumulus' Link, Flowcell (folder with the FASTQs, spatial ones included) and AuxFile
-(its sample_id column lists the sections).
+(the Flex sample table: sample_id = the sections; optional column spatial_tag, see below).
 
-Every line is processed on its own:
-    STEP 1  download the AuxFile, the pucks, the spatial FASTQs
+Section tag: the oligo that links a section's spatial beads to the 10x gel bead carries a tag, so
+every spatial read says which section it comes from (read 2 of the spatial library). By default a
+section's tag is its Flex probe barcode, taken from its Cell Ranger barcodes (GEM barcode + probe
+barcode). If you used another sequence, put it in the AuxFile column spatial_tag.
+
+Every line is processed on its own (--line N, one Terra job per line):
+    STEP 1  download the AuxFile, the pucks, the Cell Ranger barcodes, the spatial FASTQs
     STEP 2  load the pucks
-    STEP 3  read the spatial FASTQs, keep the good reads, count them per (cell barcode, UMI, bead)
+    STEP 3  load the nuclei Cell Ranger called, and each section's tag
+    STEP 4  read the spatial FASTQs, keep the good reads, count them per (section, cell barcode, UMI, bead)
     for each section:
-    STEP 4  load the nuclei Cell Ranger called in this section
     STEP 5  give each nucleus its spatial UMIs
     STEP 6  place each nucleus (DBSCAN)
-    STEP 7  save the results
+    STEP 7  save the results           -> <slidetags_output_dir>/<Link>_<sb_index>/
+
+Then every section is summarised on its own (--summarize SECTION, one Terra job per section),
+over all lines (GEM wells x spatial libraries) of the sheet:
+    STEP 8  merge_sections.py: pool the spatial libraries of each GEM well, place every nucleus
+            once, RNA UMAP/clusters, index of all files, merged positions
+    STEP 9  report_section.py: the PDF summary
+                                       -> <slidetags_output_dir>/summary/<section>/
+
+    python3 slidetags_flex.py SHEET.csv                     all lines, then all sections
+    python3 slidetags_flex.py SHEET.csv --summarize brain_section1
 """
 import argparse
 import csv
@@ -33,8 +48,9 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections import Counter
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 
 import matplotlib
 matplotlib.use("Agg")
@@ -64,7 +80,9 @@ def main():
     parser.add_argument("sample_sheet")
     parser.add_argument("--line", type=int, help="process only this line of the sheet (1 = first line after the header)")
     parser.add_argument("--count-lines", action="store_true", help="print the line numbers to process and stop (for the WDL)")
-    parser.add_argument("--barcode-length", default="auto", help="Cell Ranger barcode length without -1: auto, 16, 24, ...")
+    parser.add_argument("--list-sections", action="store_true", help="print the sections of the sheet and stop (for the WDL)")
+    parser.add_argument("--summarize", metavar="SECTION", help="only make the summary of this section (steps 8-9)")
+    parser.add_argument("--barcode-length", default="auto", help="Cell Ranger barcode length without -1: auto, 16, 26, ...")
     parser.add_argument("--knn", type=int, default=36, help="eps = median distance from a bead to its knn-th nearest bead")
     parser.add_argument("--cmes", type=float, default=10.0, help="clusters closer than eps*cmes count as one (0 = never)")
     parser.add_argument("--cores", type=int, default=os.cpu_count())
@@ -77,8 +95,43 @@ def main():
     if args.count_lines:
         print("\n".join(map(str, to_do)))
         return
+    if args.list_sections:
+        print("\n".join(sections_of_sheet(lines, args.workdir)))
+        return
+    if args.summarize:
+        summarize(args.summarize, lines, args)
+        return
     for n in to_do:
         run_line(lines[n - 1], args)
+    if args.line is None:  # whole sheet in one go (local runs): also the summaries
+        for section in sections_of_sheet(lines, args.workdir):
+            summarize(section, lines, args)
+
+
+def sections_of_sheet(lines, workdir):
+    """All sections of the sheet (the sample_ids of every line's AuxFile), in order."""
+    sections = []
+    for line in lines:
+        for section in read_auxfile(download(line["AuxFile"], os.path.join(workdir, "auxfiles", line["Link"]))[0]):
+            if section not in sections:
+                sections.append(section)
+    return sections
+
+
+def summarize(section, lines, args):
+    """STEPS 8-9 for one section: see merge_sections.py and report_section.py."""
+    import merge_sections
+    import report_section
+    print(f"\n======== summary of {section} ========")
+    folder, merged = merge_sections.merge_section(section, lines, args)
+    pdf = report_section.make_report(folder, merged)
+    for path in [os.path.join(folder, f) for f in ("files.csv", "coords.csv", "qc_per_library.csv")] + [pdf]:
+        upload(path, merged["output_dir"])
+
+
+def step(text):
+    """Progress line with the time, so the log shows how long each step took."""
+    print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
 
 
 def run_line(line, args):
@@ -88,24 +141,43 @@ def run_line(line, args):
     print(f"\n======== {name} ========")
 
     # STEP 1 - download the inputs of this line
-    print("STEP 1: downloading")
-    sections = read_auxfile(download(line["AuxFile"], work)[0])
+    step("STEP 1: downloading")
+    sections = read_auxfile(download(line["AuxFile"], work)[0])  # {section: spatial_tag or ""}
     pucks = dict(pair.strip().split("=", 1) for pair in line["pucks"].split(";") if pair.strip())
     missing = [s for s in sections if s not in pucks]
     if missing:
         raise SystemExit(f"{name}: no puck given for section(s) {missing} (sections come from the AuxFile)")
     puck_files = {s: download(pucks[s], f"{work}/pucks/{s}")[0] for s in sections}  # own folder: all are Puck.csv
+    cellranger = f"{line['cellranger_output_dir'].rstrip('/')}/{line['Link']}/per_sample_outs"
+    barcode_files = {s: download(f"{cellranger}/{s}/sample_filtered_feature_bc_matrix/barcodes.tsv.gz",
+                                 f"{work}/cellranger/{s}")[0] for s in sections}
     fastq = line["Flowcell"].rstrip("/")
     read1_files = download(f"{fastq}/{line['sb_index']}_*_R1_001.fastq.gz", f"{work}/fastqs")
     read2_files = download(f"{fastq}/{line['sb_index']}_*_R2_001.fastq.gz", f"{work}/fastqs")
 
     # STEP 2 - load the pucks
-    print("STEP 2: loading the pucks")
+    step("STEP 2: loading the pucks")
     beads = load_pucks(puck_files)
 
-    # STEP 3 - read the spatial FASTQs, filter, count
-    print("STEP 3: reading the spatial reads")
-    counts, cell_barcodes, bead_barcodes, read_log = count_spatial_reads(list(zip(read1_files, read2_files)), beads)
+    # STEP 3 - the nuclei of every section, and every section's tag
+    step("STEP 3: loading the nuclei")
+    nuclei, nuclei_log, tags = {}, {}, {}
+    for section, spatial_tag in sections.items():
+        nuclei[section], nuclei_log[section], probe_barcode = load_nuclei(section, barcode_files[section], args.barcode_length)
+        tags[section] = spatial_tag or probe_barcode
+        print(f"    tag {tags[section]} ({'spatial_tag in AuxFile' if spatial_tag else 'Flex probe barcode'})")
+
+    # STEP 4 - read the spatial FASTQs, filter, count
+    step("STEP 4: reading the spatial reads")
+    counts, cell_barcodes, bead_barcodes, read_log, library = count_spatial_reads(
+        list(zip(read1_files, read2_files)), beads, tags, args.cores)
+    library.update(line=name, gem_well=line["Link"], sb_index=line["sb_index"], tags=tags, read_filters=read_log,
+                   read1_files=[os.path.basename(f) for f in read1_files],
+                   read2_files=[os.path.basename(f) for f in read2_files])
+    os.makedirs(os.path.join(work, "results"), exist_ok=True)
+    with open(os.path.join(work, "results", "library.json"), "w") as f:
+        json.dump(library, f, indent=1, default=int)
+    upload(os.path.join(work, "results", "library.json"), output_dir)
 
     summary = []
     for section in sections:
@@ -113,28 +185,30 @@ def run_line(line, args):
         folder = os.path.join(work, "results", section)
         os.makedirs(folder, exist_ok=True)
 
-        # STEP 4 - the nuclei Cell Ranger called in this section
-        print("STEP 4: loading the nuclei")
-        barcodes_file = f"{line['cellranger_output_dir'].rstrip('/')}/{line['Link']}/per_sample_outs/{section}" \
-                        f"/sample_filtered_feature_bc_matrix/barcodes.tsv.gz"
-        nuclei, nuclei_log = load_nuclei(download(barcodes_file, f"{work}/cellranger/{section}")[0], args.barcode_length)
-
-        # STEP 5 - their spatial UMIs, from this section's puck only
-        print("STEP 5: giving each nucleus its spatial UMIs")
-        puck = beads[beads["section"] == section]
-        umis, umi_log = umis_per_nucleus(counts, cell_barcodes, bead_barcodes, puck, nuclei)
+        # STEP 5 - the section's reads -> spatial UMIs of its nuclei, on its own puck
+        step("STEP 5: giving each nucleus its spatial UMIs")
+        puck = beads[beads["section"] == section].reset_index(drop=True)
+        reads = counts[counts["section"] == section]
+        nucleus_reads, umi_log, spatial_qc = reads_of_nuclei(reads, cell_barcodes, bead_barcodes, puck, nuclei[section])
+        umis, chimera_log = umis_per_nucleus(nucleus_reads, puck)
+        umi_log.update(chimera_log)
+        spatial_qc["bead_umis_nuclei"] = np.bincount(umis["bead_row"], weights=umis["umis"], minlength=len(puck)).astype(np.int32)
+        for what, n in umi_log.items():
+            print(f"  {what}: {n:,}" if isinstance(n, (int, np.integer)) else f"  {what}: {n}")
 
         # STEP 6 - their positions
-        print("STEP 6: placing the nuclei")
-        coords, place_log = place_nuclei(umis, nuclei, puck, args.knn, args.cmes, args.cores)
+        step("STEP 6: placing the nuclei")
+        coords, place_log = place_nuclei(umis, nuclei[section], puck, args.knn, args.cmes, args.cores)
 
         # STEP 7 - save
-        print("STEP 7: saving")
-        log = {"line": name, "section": section, "STEP 3 reads": read_log, "STEP 4 nuclei": nuclei_log,
-               "STEP 5 reads": umi_log, "STEP 6 placement": place_log}
-        save_results(folder, coords, umis, nuclei, puck, log)
+        step("STEP 7: saving")
+        log = {"line": name, "section": section, "tag": tags[section], "STEP 3 nuclei": nuclei_log[section],
+               "STEP 4 reads (whole library)": read_log, "STEP 5 reads (this section)": umi_log,
+               "STEP 6 placement": place_log}
+        save_results(folder, coords, umis, nuclei[section], puck, log, nucleus_reads, spatial_qc)
         upload(folder, output_dir)
-        summary.append({"line": name, "section": section, **nuclei_log, **place_log})
+        summary.append({"line": name, "section": section, "tag": tags[section],
+                        "spatial reads": read_log["reads per section"][section], **nuclei_log[section], **place_log})
 
     pd.DataFrame(summary).to_csv(f"{work}/results/summary.csv", index=False)
     upload(f"{work}/results/summary.csv", output_dir)
@@ -172,9 +246,10 @@ def upload(local, destination):
 
 
 def read_auxfile(path):
-    """The sections = the sample_id column of the Flex AuxFile."""
+    """The Flex AuxFile: sample_id = the sections; spatial_tag (optional column, may be empty)."""
     with open(path, newline="") as f:
-        return [row["sample_id"].strip() for row in csv.DictReader(f) if row["sample_id"].strip()]
+        return {row["sample_id"].strip(): (row.get("spatial_tag") or "").strip().upper()
+                for row in csv.DictReader(f) if row["sample_id"].strip()}
 
 
 # =====================================================================================
@@ -183,8 +258,8 @@ def read_auxfile(path):
 def load_pucks(puck_files):
     """One table with the beads of all pucks: barcode, x, y, section.
     Removed (as in the R pipeline): barcodes with an N, and degenerate barcodes (one base > 4/5 of
-    the barcode, or a run of one base > 5/7 of it). A barcode that is on two pucks is kept: we know
-    each nucleus' section, so we know which puck its reads came from."""
+    the barcode, or a run of one base > 5/7 of it). A barcode that is on two pucks is kept: the
+    read's tag says which section, so which puck, it came from."""
     pucks = []
     for section, path in puck_files.items():
         puck = pd.read_csv(path, header=None, usecols=[0, 1, 2], names=["barcode", "x", "y"], dtype={0: str})
@@ -203,67 +278,162 @@ def is_degenerate(barcode):
 
 
 # =====================================================================================
-# STEP 3 - spatial reads
+# STEP 3 - nuclei called by Cell Ranger in one section
 # =====================================================================================
-def count_spatial_reads(fastq_pairs, beads):
-    """Read every read pair, keep the good ones, count reads per (cell barcode, UMI, bead).
-    Returns counts (columns cell, umi, bead, reads: cell and bead are row numbers in the two
-    returned barcode lists), the cell barcode list, the bead barcode list and the filter log."""
+def load_nuclei(section, barcodes_file, barcode_length="auto"):
+    """Cell Ranger barcode = GEM barcode (16 bases) + Flex probe barcode (multiplex Flex) + "-1".
+    The spatial reads carry the GEM barcode in read 1 (and the section tag in read 2).
+    Two nuclei of this section with the same GEM barcode (same droplet) cannot be told apart:
+    both are left out. Also returns the section's probe barcode (empty if there is none)."""
+    with gzip.open(barcodes_file, "rt") as f:
+        cellranger = [row.strip() for row in f if row.strip()]
+    length = len(cellranger[0].split("-")[0])
+    if barcode_length != "auto" and int(barcode_length) != length:
+        raise SystemExit(f"Cell Ranger barcodes have {length} bases, not {barcode_length} ({cellranger[0]})")
+    probe_barcode = Counter(b.split("-")[0][CELL_BARCODE_LENGTH:] for b in cellranger).most_common(1)[0][0]
+    nuclei = pd.DataFrame({"cellranger_barcode": cellranger, "gem_barcode": [b[:CELL_BARCODE_LENGTH] for b in cellranger]})
+    shared = nuclei["gem_barcode"].duplicated(keep=False)
+    print(f"  {section}: {len(nuclei):,} nuclei, barcode {cellranger[0]} = GEM {cellranger[0][:CELL_BARCODE_LENGTH]}"
+          f" + probe barcode {probe_barcode or '(none)'}; {shared.sum()} left out (same droplet)")
+    return nuclei[~shared].reset_index(drop=True), {"nuclei called": len(nuclei), "barcode length": length,
+                                                    "nuclei left out (same droplet)": int(shared.sum())}, probe_barcode
 
-    # 3a. Which read holds the bead and which bead type: count UP-site hits in the first 100,000 reads
+
+# =====================================================================================
+# STEP 4 - spatial reads
+# =====================================================================================
+def count_spatial_reads(fastq_pairs, beads, tags, cores=1):
+    """Read every read pair, keep the good ones, count reads per (section, cell barcode, UMI, bead).
+    Returns counts (columns section, cell, umi, bead, reads: cell and bead are row numbers in the
+    two returned barcode lists), the cell barcode list, the bead barcode list and the filter log."""
+
+    # 4a. Which read holds the bead and which bead type: count UP-site hits in the first 100,000 reads
     bead_in_read1, bead_type = detect_layout(fastq_pairs)
     layout = BEAD_TYPES[bead_type]
     part1 = PART1_LENGTH[bead_type]
     part2 = len(beads["barcode"].iat[0]) - part1  # old 14-base V10 pucks: last base not used
     print(f"  bead type {bead_type}, bead in read {1 if bead_in_read1 else 2}")
 
-    # 3b. What counts as a good UP site / bad UMI (1 mismatch allowed per 6 bases of UP)
+    # 4b. Where the section tag is in the bead read: the position where the tags are found most
+    #     (as written, or reverse-complemented), in the first 100,000 reads
+    tag_start, tag_length, section_of_tag, tag_how, tag_fraction = find_tags(fastq_pairs[0][0 if bead_in_read1 else 1], tags)
+    min_read2_length = max(layout["min_length"], tag_start + tag_length)
+
+    # 4c. What counts as a good UP site / bad UMI (1 mismatch allowed per 6 bases of UP)
     up_ok = within_mismatches(layout["up_seq"], round(len(layout["up_seq"]) / 6))
     up_all_g = within_mismatches("G" * len(layout["up_seq"]), round(len(layout["up_seq"]) / 6))
     umi_bad = set().union(*(within_mismatches(base * UMI_LENGTH, 2) for base in "ACGT"))
     bead_number = {barcode: i for i, barcode in enumerate(sorted(set(beads["barcode"])))}
 
-    # 3c. Go through all reads
+    # 4d. Go through all reads. Each lane (R1/R2 file pair) is read by its own process, in parallel.
+    global READ_SETUP  # what every process needs; shared with them by fork (not copied up front)
+    READ_SETUP = dict(bead_in_read1=bead_in_read1, layout=layout, part1=part1, part2=part2, up_ok=up_ok,
+                      up_all_g=up_all_g, umi_bad=umi_bad, bead_number=bead_number, tag_start=tag_start,
+                      tag_length=tag_length, section_of_tag=section_of_tag, min_read2_length=min_read2_length,
+                      section_code={s: i for i, s in enumerate(tags)})
+    processes = max(1, min(cores, len(fastq_pairs)))
+    print(f"  reading {len(fastq_pairs)} lane(s) with {processes} process(es)", flush=True)
+    if processes == 1:
+        lanes = [read_one_lane(pair) for pair in fastq_pairs]
+    else:
+        with get_context("fork").Pool(processes) as pool:
+            lanes = pool.map(read_one_lane, fastq_pairs, chunksize=1)
+
+    # 4e. Put the lanes together: one cell numbering, add up the reads of the same (section, cell, UMI, bead)
+    log, match, fuzzy_position = Counter(), {"UP site": Counter(), "bead barcode": Counter(), "section tag": Counter()}, Counter()
+    cell_number, tables = {}, []
+    for lane_log, lane_match, lane_fuzzy, lane_cells, lane_counts in lanes:
+        log.update(lane_log)
+        fuzzy_position.update(lane_fuzzy)
+        for part in match:
+            match[part].update(lane_match[part])
+        to_global = np.array([cell_number.setdefault(c, len(cell_number)) for c in lane_cells], dtype=np.int64)
+        tables.append(lane_counts.assign(cell=to_global[lane_counts["cell"].to_numpy()] if len(lane_cells) else lane_counts["cell"]))
+    counts = pd.concat(tables).groupby(["section", "cell", "umi", "bead"], as_index=False)["reads"].sum()
+    counts["section"] = pd.Categorical.from_codes(counts["section"].to_numpy(), categories=list(tags))
+    log["reads kept"] = int(counts["reads"].sum())
+    log = dict(log)
+    log["reads per section"] = {s: int(n) for s, n in counts.groupby("section", observed=True)["reads"].sum().items()}
+    log["reads per section"] = {s: log["reads per section"].get(s, 0) for s in tags}
+    print(f"  {log['reads']:,} reads, {log['reads kept']:,} kept: " +
+          ", ".join(f"{s} {n:,}" for s, n in log["reads per section"].items()))
+
+    # 4f. Library numbers for the summary PDF
+    reads_per_umi = counts["reads"].value_counts().sort_index()  # how many (cell, UMI, bead) have 1, 2, ... reads
+    fractions = np.linspace(0, 1, 21)
+    library = {
+        "bead type": bead_type, "bead in read 1 (R1 <-> R2)": bool(bead_in_read1),
+        "tag position (1-based)": f"{tag_start + 1}-{tag_start + tag_length}",
+        "tag orientation": tag_how, "reads with a tag (first 100,000)": round(tag_fraction, 4),
+        "matching (reads)": {k: dict(v) for k, v in match.items()},
+        "bead barcode mismatch position (reads)": {int(k) + 1: v for k, v in sorted(fuzzy_position.items())},
+        "reads per UMI": {int(k): int(v) for k, v in reads_per_umi.items()},
+        "sequencing saturation": round(1 - len(counts) / max(int(counts["reads"].sum()), 1), 4),
+        # expected UMIs if only a fraction of the reads had been sequenced: each (cell, UMI, bead)
+        # with r reads is still seen with probability 1 - (1 - f)^r
+        "downsampling": {"fraction of reads": fractions.round(2).tolist(),
+                         "reads": (fractions * log["reads"]).round().tolist(),
+                         "UMIs": [float((reads_per_umi * (1 - (1 - f) ** reads_per_umi.index)).sum()) for f in fractions]},
+    }
+    return counts, list(cell_number), list(bead_number), log, library
+
+
+def read_one_lane(fastq_pair):
+    """STEP 4d for one lane: every read pair through the 5 filters. Returns the filter log, the
+    matching counts, the bead-barcode mismatch positions, the lane's cell barcodes, and the reads
+    kept, counted per (section, cell, UMI, bead) (section and cell as numbers)."""
+    r = READ_SETUP
+    layout, up_start, up_end = r["layout"], r["layout"]["up"][0], r["layout"]["up"][1]
+    read1_file, read2_file = fastq_pair[::-1] if r["bead_in_read1"] else fastq_pair
+    print(f"  reading {os.path.basename(read1_file)}", flush=True)
     log = Counter()
+    match = {"UP site": Counter(), "bead barcode": Counter(), "section tag": Counter()}
+    fuzzy_position = Counter()  # where the 1 mismatch is, for beads found with 1 mismatch
     cell_number = {}
     kept, tables = [], []
-    for read1_file, read2_file in fastq_pairs:
-        if bead_in_read1:
-            read1_file, read2_file = read2_file, read1_file
-        print(f"  reading {os.path.basename(read1_file)}", flush=True)
-        for read1, read2 in zip(fastq_sequences(read1_file), fastq_sequences(read2_file)):
-            log["reads"] += 1
-            # filter 1: long enough?
-            if len(read1) < CELL_BARCODE_LENGTH + UMI_LENGTH or len(read2) < layout["min_length"]:
-                log["removed: too short"] += 1
-                continue
-            # filter 2: UMI without N and not one base repeated
-            umi = read1[CELL_BARCODE_LENGTH:CELL_BARCODE_LENGTH + UMI_LENGTH]
-            if "N" in umi or umi in umi_bad:
-                log["removed: bad UMI"] += 1
-                continue
-            # filter 3: UP site present
-            up = read2[layout["up"][0]:layout["up"][1]]
-            if up not in up_ok:
-                log["removed: all-G read" if up in up_all_g else "removed: no UP site"] += 1
-                continue
-            # filter 4: spatial barcode = a bead on the pucks (exact or 1 mismatch to one bead)
-            spatial_barcode = read2[layout["part1"]:layout["part1"] + part1] + read2[layout["part2"]:layout["part2"] + part2]
-            bead = find_bead(spatial_barcode, bead_number)
-            if bead is None:
-                log["removed: no bead / ambiguous bead"] += 1
-                continue
-            # keep it
-            cell = cell_number.setdefault(read1[:CELL_BARCODE_LENGTH], len(cell_number))
-            kept.append((cell, umi_to_number(umi), bead))
-            if len(kept) == 5_000_000:  # add up duplicates now and then to save memory
-                tables.append(pd.DataFrame(kept, columns=["cell", "umi", "bead"]).value_counts().rename("reads"))
-                kept = []
-    tables.append(pd.DataFrame(kept, columns=["cell", "umi", "bead"]).value_counts().rename("reads"))
-    counts = pd.concat(tables).groupby(level=[0, 1, 2]).sum().reset_index()
-    log["reads kept"] = int(counts["reads"].sum())
-    print(f"  {log['reads']:,} reads, {log['reads kept']:,} kept")
-    return counts, list(cell_number), list(bead_number), dict(log)
+    columns = ["section", "cell", "umi", "bead"]
+    for read1, read2 in zip(fastq_sequences(read1_file), fastq_sequences(read2_file)):
+        log["reads"] += 1
+        # filter 1: long enough?
+        if len(read1) < CELL_BARCODE_LENGTH + UMI_LENGTH or len(read2) < r["min_read2_length"]:
+            log["removed: too short"] += 1
+            continue
+        # filter 2: UMI without N and not one base repeated
+        umi = read1[CELL_BARCODE_LENGTH:CELL_BARCODE_LENGTH + UMI_LENGTH]
+        if "N" in umi or umi in r["umi_bad"]:
+            log["removed: bad UMI"] += 1
+            continue
+        # filter 3: UP site present
+        up = read2[up_start:up_end]
+        if up not in r["up_ok"]:
+            match["UP site"]["GG" if up in r["up_all_g"] else "none"] += 1
+            log["removed: all-G read" if up in r["up_all_g"] else "removed: no UP site"] += 1
+            continue
+        match["UP site"]["exact" if up == layout["up_seq"] else "fuzzy"] += 1
+        # filter 4: spatial barcode = a bead on the pucks (exact or 1 mismatch to one bead)
+        spatial_barcode = read2[layout["part1"]:layout["part1"] + r["part1"]] + read2[layout["part2"]:layout["part2"] + r["part2"]]
+        bead, how, position = find_match(spatial_barcode, r["bead_number"])
+        match["bead barcode"][how] += 1
+        if how == "fuzzy":
+            fuzzy_position[position] += 1
+        if bead is None:
+            log["removed: no bead / ambiguous bead"] += 1
+            continue
+        # filter 5: section tag (exact or 1 mismatch to one section's tag)
+        section, how, _ = find_match(read2[r["tag_start"]:r["tag_start"] + r["tag_length"]], r["section_of_tag"])
+        match["section tag"][how] += 1
+        if section is None:
+            log["removed: no section tag"] += 1
+            continue
+        # keep it
+        cell = cell_number.setdefault(read1[:CELL_BARCODE_LENGTH], len(cell_number))
+        kept.append((r["section_code"][section], cell, umi_to_number(umi), bead))
+        if len(kept) == 2_000_000:  # add up duplicates now and then to save memory
+            tables.append(pd.DataFrame(kept, columns=columns).value_counts().rename("reads").reset_index())
+            kept = []
+    tables.append(pd.DataFrame(kept, columns=columns).value_counts().rename("reads").reset_index())
+    counts = pd.concat(tables).groupby(columns, as_index=False)["reads"].sum()
+    return log, match, fuzzy_position, list(cell_number), counts
 
 
 def detect_layout(fastq_pairs):
@@ -281,12 +451,47 @@ def detect_layout(fastq_pairs):
     return bead_in_read1, max(BEAD_TYPES, key=lambda t: hits[t])
 
 
+def find_tags(bead_read_file, tags):
+    """Find where the section tags sit in the bead read. Returns (start, length, {tag as read: section})."""
+    if len({len(t) for t in tags.values()}) != 1 or not all(tags.values()):
+        raise SystemExit(f"Every section needs a tag, all of the same length: {tags} (AuxFile column spatial_tag)")
+    length = len(next(iter(tags.values())))
+    reverse = str.maketrans("ACGT", "TGCA")
+    options = {"as written": {t: s for s, t in tags.items()},
+               "reverse complement": {t.translate(reverse)[::-1]: s for s, t in tags.items()}}
+    reads = list(fastq_sequences(bead_read_file, max_reads=100_000))
+    best = max(((sum(r[p:p + length] in found for r in reads), p, how)
+                for how, found in options.items() for p in range(max(map(len, reads)) - length + 1)))
+    hits, start, how = best
+    print(f"  section tags found at read bases {start + 1}-{start + length} ({how}) in {100 * hits / len(reads):.1f}% of reads")
+    if hits < 0.1 * len(reads):
+        raise SystemExit(f"The section tags {tags} are in less than 10% of the spatial reads: check spatial_tag in the AuxFile")
+    return start, length, options[how], how, hits / len(reads)
+
+
+def find_match(barcode, table):
+    """Look a barcode up in table {barcode: value}: exact, or the only entry 1 mismatch away.
+    Returns (value or None, "exact" / "fuzzy" / "ambiguous" / "none", 0-based mismatch position or -1).
+    Used for the bead barcodes and the section tags."""
+    if barcode in table:
+        return table[barcode], "exact", -1
+    hits = {}
+    for position, variant in one_mismatch_with_position(barcode):
+        if variant in table:
+            hits[table[variant]] = position
+    if len(hits) == 1:
+        value, position = hits.popitem()
+        return value, "fuzzy", position
+    return None, ("ambiguous" if hits else "none"), -1
+
+
 def find_bead(barcode, bead_number):
     """Exact match, or the only bead 1 mismatch away. None if no bead or 2+ beads are 1 mismatch away."""
-    if barcode in bead_number:
-        return bead_number[barcode]
-    hits = {bead_number[b] for b in one_mismatch(barcode) if b in bead_number}
-    return hits.pop() if len(hits) == 1 else None
+    return find_match(barcode, bead_number)[0]
+
+
+def one_mismatch_with_position(seq):
+    return [(i, seq[:i] + base + seq[i + 1:]) for i in range(len(seq)) for base in "ACGTN" if base != seq[i]]
 
 
 def one_mismatch(seq):
@@ -318,36 +523,19 @@ def fastq_sequences(path, max_reads=None):
 
 
 # =====================================================================================
-# STEP 4 - nuclei called by Cell Ranger in one section
-# =====================================================================================
-def load_nuclei(barcodes_file, barcode_length="auto"):
-    """Cell Ranger barcode (e.g. 24 bases + -1 in multiplex Flex) -> GEM barcode (first 16 bases),
-    which is what the spatial reads carry. Two nuclei of this section with the same GEM barcode
-    (same droplet) cannot be told apart: both are left out."""
-    with gzip.open(barcodes_file, "rt") as f:
-        cellranger = [row.strip() for row in f if row.strip()]
-    length = len(cellranger[0].split("-")[0])
-    if barcode_length != "auto" and int(barcode_length) != length:
-        raise SystemExit(f"Cell Ranger barcodes have {length} bases, not {barcode_length} ({cellranger[0]})")
-    nuclei = pd.DataFrame({"cellranger_barcode": cellranger, "gem_barcode": [b[:CELL_BARCODE_LENGTH] for b in cellranger]})
-    shared = nuclei["gem_barcode"].duplicated(keep=False)
-    print(f"  {len(nuclei):,} nuclei, barcode length {length} (e.g. {cellranger[0]} -> {nuclei['gem_barcode'][0]}); "
-          f"{shared.sum()} left out (same droplet)")
-    return nuclei[~shared].reset_index(drop=True), {"nuclei called": len(nuclei), "barcode length": length,
-                                                    "nuclei left out (same droplet)": int(shared.sum())}
-
-
-# =====================================================================================
 # STEP 5 - spatial UMIs of every nucleus of one section
 # =====================================================================================
-def umis_per_nucleus(counts, cell_barcodes, bead_barcodes, puck, nuclei):
-    log = {"reads": int(counts["reads"].sum())}
+def reads_of_nuclei(counts, cell_barcodes, bead_barcodes, puck, nuclei):
+    """counts = the reads with this section's tag. Returns the reads of this section's nuclei
+    (nucleus, umi, bead_row, reads; bead_row = row of the bead in puck), the log, and QC numbers."""
+    log = {"reads with this section's tag": int(counts["reads"].sum())}
 
-    # 5a. keep only reads whose bead is on this section's puck (the rest belong to other sections)
-    puck_barcodes = set(puck["barcode"])
-    on_puck = np.array([b in puck_barcodes for b in bead_barcodes])
-    reads = counts[on_puck[counts["bead"]]].copy()
-    log["removed: bead on the other section's puck"] = log["reads"] - int(reads["reads"].sum())
+    # 5a. keep only reads whose bead is on this section's puck (a check: should be almost all)
+    row_of = {b: i for i, b in reversed(list(enumerate(puck["barcode"])))}  # first row if a barcode is twice
+    bead_row = np.array([row_of.get(b, -1) for b in bead_barcodes], dtype=np.int64)
+    reads = counts.assign(bead_row=bead_row[counts["bead"].to_numpy()])
+    reads = reads[reads["bead_row"] >= 0]
+    log["removed: bead not on this section's puck"] = log["reads with this section's tag"] - int(reads["reads"].sum())
 
     # 5b. match each read's cell barcode to a nucleus: exact, or the only nucleus 1 mismatch away.
     #     If swapping bases 8-9 (as 10x does between some library types) explains more reads, use that.
@@ -358,24 +546,38 @@ def umis_per_nucleus(counts, cell_barcodes, bead_barcodes, puck, nuclei):
     barcodes_seen = [cell_barcodes[c] for c in reads_per_cell.index]
     exact_plain = sum(n for b, n in zip(barcodes_seen, reads_per_cell) if b in nucleus_of)
     exact_swapped = sum(n for b, n in zip(barcodes_seen, reads_per_cell) if b in swapped)
-    if len(swapped) == len(nucleus_of) and exact_swapped > exact_plain:
+    remap = len(swapped) == len(nucleus_of) and exact_swapped > exact_plain
+    if remap:
         print("  using the 10x bases 8-9 swap for cell barcodes")
         nucleus_of = swapped
-    nucleus = {}
-    for cell, barcode in zip(reads_per_cell.index, barcodes_seen):
-        if barcode in nucleus_of:
-            nucleus[cell] = nucleus_of[barcode]
-        else:
-            hits = {nucleus_of[b] for b in one_mismatch(barcode) if b in nucleus_of}
-            if len(hits) == 1:
-                nucleus[cell] = hits.pop()
+    nucleus, cell_matching = {}, Counter()
+    for cell, barcode, n in zip(reads_per_cell.index, barcodes_seen, reads_per_cell):
+        found, how, _ = find_match(barcode, nucleus_of)
+        cell_matching[how] += int(n)
+        if found is not None:
+            nucleus[cell] = found
     reads["nucleus"] = reads["cell"].map(nucleus)
+
+    # QC numbers: spatial UMIs per cell barcode (all barcodes / nuclei) and per bead (all barcodes)
+    umis_per_cell = reads.groupby("cell").size()
+    called = umis_per_cell.index.isin(list(nucleus))
+    qc = {"cell_umis_all": np.sort(umis_per_cell.to_numpy())[::-1].astype(np.int32),
+          "cell_umis_called": np.sort(umis_per_cell.to_numpy()[called])[::-1].astype(np.int32),
+          "bead_umis_all": np.bincount(reads["bead_row"], minlength=len(puck)).astype(np.int32)}
+    log["cell barcode matching (reads)"] = dict(cell_matching)
+    log["10x bases 8-9 swap used"] = bool(remap)
 
     # 5c. remove reads whose cell barcode is not a nucleus of this section (empty droplets, ambient)
     log["removed: not a nucleus of this section"] = int(reads.loc[reads["nucleus"].isna(), "reads"].sum())
     reads = reads.dropna(subset=["nucleus"]).astype({"nucleus": int})
-    reads = reads.groupby(["nucleus", "umi", "bead"], as_index=False)["reads"].sum()
+    reads = reads.groupby(["nucleus", "umi", "bead_row"], as_index=False)["reads"].sum()
+    return reads, log, qc
 
+
+def umis_per_nucleus(reads, puck):
+    """reads = nucleus, umi, bead_row, reads (one section; can be several libraries pooled).
+    Returns UMIs per (nucleus, bead) with the bead's position, and the log."""
+    log = {}
     # 5d. remove chimeras: a UMI of a nucleus comes from ONE bead. Keep the bead with strictly most reads.
     most = reads.groupby(["nucleus", "umi"])["reads"].transform("max")
     top = reads["reads"] == most
@@ -385,12 +587,11 @@ def umis_per_nucleus(counts, cell_barcodes, bead_barcodes, puck, nuclei):
     log["reads used"] = int(reads["reads"].sum())
 
     # 5e. UMIs per (nucleus, bead), with the bead's position on this puck
-    umis = reads.groupby(["nucleus", "bead"]).size().rename("umis").reset_index()
-    umis["barcode"] = np.array(bead_barcodes)[umis["bead"]]
-    umis = umis.merge(puck[["barcode", "x", "y"]], on="barcode")
+    umis = reads.groupby(["nucleus", "bead_row"]).size().rename("umis").reset_index()
+    umis["barcode"] = puck["barcode"].to_numpy()[umis["bead_row"]]
+    umis["x"] = puck["x"].to_numpy()[umis["bead_row"]]
+    umis["y"] = puck["y"].to_numpy()[umis["bead_row"]]
     log["UMIs used"] = int(umis["umis"].sum())
-    for what, n in log.items():
-        print(f"  {what}: {n:,}")
     return umis, log
 
 
@@ -412,7 +613,7 @@ def place_nuclei(umis, nuclei, puck, knn, cmes, cores):
     eps = float(np.median(cKDTree(xy).query(xy[sample], k=knn)[0][:, knn - 1]))
 
     # 6b. the one-cluster range (i2, i1] of every nucleus
-    beads_of = {n: g for n, g in umis.groupby("nucleus")}
+    beads_of = {n: g for n, g in umis.groupby("nucleus")}  # nucleus = row of the nuclei table
     nuclei_beads = [beads_of.get(n, umis.iloc[:0])[["x", "y", "umis"]].to_numpy() for n in range(len(nuclei))]
     with Pool(cores) as pool:
         ranges = pool.starmap(one_cluster_range, [(b, eps, cmes) for b in nuclei_beads])
@@ -425,10 +626,12 @@ def place_nuclei(umis, nuclei, puck, knn, cmes, cores):
         min_pts = int(values[np.flatnonzero(nuclei_ok == nuclei_ok.max())[-1]])
 
         # 6d. final DBSCAN of every nucleus at that min_pts
-        rows = pool.starmap(final_position, [(b, eps, cmes, min_pts, i2_n) for b, i2_n in zip(nuclei_beads, i2)])
+        rows = pool.starmap(final_position, [(b, eps, cmes, min_pts, i2_n, i1_n)
+                                             for b, i2_n, i1_n in zip(nuclei_beads, i2, i1)])
 
     coords = pd.concat([nuclei, pd.DataFrame(rows)], axis=1)
     coords["score"] = placement_score(coords["umi_main"].to_numpy(float), coords["umi_second"].to_numpy(float))
+    coords["i1"], coords["i2"], coords["min_pts"], coords["eps"] = i1, i2, min_pts, eps
     placed = int(coords["placed"].sum())
     print(f"  eps {eps:.1f}, min_pts {min_pts}: placed {placed:,} of {len(coords):,} nuclei")
     return coords, {"eps": round(eps, 3), "min_pts": min_pts, "nuclei positioned": len(coords),
@@ -486,19 +689,40 @@ def one_cluster_range(beads, eps, cmes):
     return i1, i2
 
 
-def final_position(beads, eps, cmes, min_pts, i2):
-    """Position at the section's min_pts + the two largest clusters at the nucleus' own i2 (for the score)."""
-    row = dict(x=np.nan, y=np.nan, placed=False, clusters=0, umi=0, beads=0, spread=np.nan,
-               umi_main=np.nan, umi_second=np.nan)
+def final_position(beads, eps, cmes, min_pts, i2, i1=None):
+    """One nucleus.
+    Global DBSCAN (the section's min_pts): placed at cluster 1 if there is exactly 1 cluster.
+      x, y, clusters, umi/beads (all its beads), x1, y1, umi1, beads1, rmsd1 (spread), h1 (h-index), snr
+      (= umi1 / umi) of cluster 1, and x2, y2, umi2 of cluster 2 when there are 2+ clusters.
+    Dynamic DBSCAN (the nucleus' own min_pts): x_dynamic, y_dynamic = its cluster at i1 (the highest
+      min_pts that still gives a cluster), and umi_main / umi_second = UMIs of the two largest
+      clusters at i2 (the highest min_pts giving 2+ clusters), used for the score."""
+    row = dict(x=np.nan, y=np.nan, placed=False, clusters=0, umi=0, beads=0, x1=np.nan, y1=np.nan, umi1=np.nan, beads1=np.nan,
+               rmsd1=np.nan, h1=np.nan, snr=np.nan, x2=np.nan, y2=np.nan, umi2=np.nan,
+               x_dynamic=np.nan, y_dynamic=np.nan, umi_main=np.nan, umi_second=np.nan)
     if len(beads) == 0:
         return row
     cluster = merge_close(beads, dbscan(beads, eps, min_pts), eps * cmes)
     row.update(clusters=int(cluster.max()), umi=int(beads[:, 2].sum()), beads=len(beads))
+    for c in (1, 2):
+        if cluster.max() >= c:
+            inside = beads[cluster == c]
+            centre = np.average(inside[:, :2], axis=0, weights=inside[:, 2])
+            if c == 1:
+                ranked = np.sort(inside[:, 2])[::-1]
+                row.update(x1=centre[0], y1=centre[1], umi1=int(inside[:, 2].sum()), beads1=len(inside),
+                           rmsd1=float(np.sqrt(np.average(((inside[:, :2] - centre) ** 2).sum(1), weights=inside[:, 2]))),
+                           h1=int(np.sum(ranked >= np.arange(1, len(ranked) + 1))))
+                row["snr"] = row["umi1"] / row["umi"]
+            else:
+                row.update(x2=centre[0], y2=centre[1], umi2=int(inside[:, 2].sum()))
     if row["clusters"] == 1:
-        inside = beads[cluster == 1]
-        centre = np.average(inside[:, :2], axis=0, weights=inside[:, 2])
-        row.update(x=centre[0], y=centre[1], placed=True,
-                   spread=float(np.sqrt(np.average(((inside[:, :2] - centre) ** 2).sum(1), weights=inside[:, 2]))))
+        row.update(x=row["x1"], y=row["y1"], placed=True)
+    if i1:
+        at_i1 = dbscan(beads, eps, i1)
+        if at_i1.max() == 1:
+            inside = beads[at_i1 == 1]
+            row["x_dynamic"], row["y_dynamic"] = np.average(inside[:, :2], axis=0, weights=inside[:, 2])
     at_i2 = merge_close(beads, dbscan(beads, eps, i2), eps * cmes)
     sizes = sorted((beads[at_i2 == c, 2].sum() for c in range(1, at_i2.max() + 1)), reverse=True)
     row["umi_main"] = sizes[0] if sizes else np.nan
@@ -523,17 +747,25 @@ def placement_score(umi_main, umi_second):
 # =====================================================================================
 # STEP 7 - save
 # =====================================================================================
-def save_results(folder, coords, umis, nuclei, puck, log):
+def save_results(folder, coords, umis, nuclei, puck, log, nucleus_reads, spatial_qc):
     """coords.csv (one row per nucleus, join with RNA on cellranger_barcode), umis.csv.gz (UMIs per
-    nucleus and bead), log.json (reads removed at every filter), summary.png (QC)."""
+    nucleus and bead), log.json (reads removed at every filter), summary.png (quick QC), and for the
+    section summary (step 8-9): nucleus_reads.npz (reads of the nuclei, to pool libraries of one
+    GEM well) and spatial_qc.npz (UMIs per cell barcode and per bead)."""
     coords.to_csv(f"{folder}/coords.csv", index=False)
+    np.savez_compressed(f"{folder}/nucleus_reads.npz", nucleus=nucleus_reads["nucleus"].to_numpy(np.int32),
+                        umi=nucleus_reads["umi"].to_numpy(np.int64), bead_row=nucleus_reads["bead_row"].to_numpy(np.int32),
+                        reads=nucleus_reads["reads"].to_numpy(np.int32),
+                        cellranger_barcode=nuclei["cellranger_barcode"].to_numpy(str), puck_beads=len(puck))
+    np.savez_compressed(f"{folder}/spatial_qc.npz", **spatial_qc)
     umis.assign(cellranger_barcode=nuclei["cellranger_barcode"].to_numpy()[umis["nucleus"]])[
         ["cellranger_barcode", "barcode", "umis", "x", "y"]].to_csv(f"{folder}/umis.csv.gz", index=False)
     with open(f"{folder}/log.json", "w") as f:
         json.dump(log, f, indent=2, default=int)
 
     fig, (a, b, c) = plt.subplots(1, 3, figsize=(18, 5.5))
-    funnel = {**{k: v for k, v in log["STEP 3 reads"].items()}, **log["STEP 5 reads"]}
+    library = {k: v for k, v in log["STEP 4 reads (whole library)"].items() if k != "reads per section"}
+    funnel = {**library, **{k: v for k, v in log["STEP 5 reads (this section)"].items() if not isinstance(v, (dict, bool))}}
     a.barh(list(funnel)[::-1], list(funnel.values())[::-1])
     a.set_title("spatial reads at each filter")
     b.hist(np.log10(coords["umi"].clip(lower=1)), bins=40)

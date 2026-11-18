@@ -1,0 +1,29 @@
+{
+  "slidetags_flex.input_csv_file":      "gs://fc-secure-d99fbd65-eb27-4989-95b4-4cf559aa7d36/flex/cumulus_cellranger_inputs/Pilot_FFPE_092026/Pilot_FFPE_092026-cumulus_sample_sheet.csv",
+  "cellranger_workflow.input_csv_file": "gs://fc-secure-d99fbd65-eb27-4989-95b4-4cf559aa7d36/flex/cumulus_cellranger_inputs/Pilot_FFPE_092026/Pilot_FFPE_092026-cumulus_sample_sheet.csv",
+  "slidetags_flex.zones":      "us-central1-a us-central1-b us-central1-c us-central1-f",
+  "cellranger_workflow.zones": "us-central1-a us-central1-b us-central1-c us-central1-f",
+
+  "cellranger_workflow.output_directory": "gs://fc-secure-d99fbd65-eb27-4989-95b4-4cf559aa7d36/flex/outputs/Pilot_FFPE_092026",
+  "cellranger_workflow.cellranger_version": "10.1.0",
+  "cellranger_workflow.no_bam": true,
+  "cellranger_workflow.secondary": false,
+  "cellranger_workflow.num_cpu": 32,
+  "cellranger_workflow.memory": "120G",
+  "cellranger_workflow.multi_disk_space": 1500,
+  "cellranger_workflow.preemptible": 2,
+  "cellranger_workflow.docker_registry": "quay.io/cumulus",
+
+  "slidetags_flex.docker": "8gabri8/slidetags-flex:v2.0.0",
+  "slidetags_flex.only_summarize": false,
+  "slidetags_flex.barcode_length": "auto",
+  "slidetags_flex.knn": 36,
+  "slidetags_flex.cmes": 10.0,
+  "slidetags_flex.num_cpu": 8,
+  "slidetags_flex.memory": "32G",
+  "slidetags_flex.disk_space": 100,
+  "slidetags_flex.preemptible": 1,
+  "slidetags_flex.summarize_num_cpu": 8,
+  "slidetags_flex.summarize_memory": "64G",
+  "slidetags_flex.summarize_disk_space": 100
+}
