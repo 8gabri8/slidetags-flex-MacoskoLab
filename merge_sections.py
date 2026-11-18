@@ -8,7 +8,8 @@ different sb_index). This step collects all of them:
     8a. find the lines of the sheet that contain this section (its sample_id is in their AuxFile)
     8b. download, per GEM well, the Cell Ranger results of this section (RNA counts, metrics,
         unfiltered matrix) and, per spatial library, the results of steps 1-7
-    8c. POOL the spatial libraries of each GEM well and place every nucleus ONCE:
+    8c. one position per nucleus. A GEM well with ONE spatial library: its placement from step 6 is
+        used as it is. A GEM well with SEVERAL spatial libraries: POOL them and place every nucleus once:
           - libraries of the same GEM well come from the same cDNA, so they contain the same
             nuclei (same GEM barcodes). Their reads of each (nucleus, UMI, bead) are added up
             (the same molecule seen in two libraries counts once), chimeras are removed again,
@@ -16,7 +17,6 @@ different sb_index). This step collects all of them:
           - min_pts is chosen per GEM well (as the R pipeline does per library): GEM wells can
             have very different spatial depth, and one min_pts for all would under-place the
             shallow ones. eps comes from the puck, so it is the same for all.
-          - a GEM well with one library gives the same positions as its line (steps 1-7).
     8d. RNA: counts of all nuclei of the section (all GEM wells together, no batch correction):
         UMIs, genes and %mito per nucleus, then scanpy: normalize, log, 2,000 variable genes,
         PCA, neighbours, UMAP, Leiden clusters (resolution 1.0)
@@ -98,24 +98,31 @@ def merge_section(section, lines, args):
         with open(core.download(f"{source}/{section}/log.json", folder)[0]) as f:
             library["log"] = json.load(f)
         library["coords"] = pd.read_csv(core.download(f"{source}/{section}/coords.csv", folder)[0])
-        library["reads"] = dict(np.load(core.download(f"{source}/{section}/nucleus_reads.npz", folder)[0]))
         library["qc"] = dict(np.load(core.download(f"{source}/{section}/spatial_qc.npz", folder)[0]))
-        if int(library["reads"]["puck_beads"]) != len(puck):
-            raise SystemExit(f"{name}: its puck had {int(library['reads']['puck_beads'])} beads, the section's puck has {len(puck)}")
+        if len(library["qc"]["bead_umis_all"]) != len(puck):
+            raise SystemExit(f"{name}: its puck had {len(library['qc']['bead_umis_all'])} beads, the section's puck has {len(puck)}")
         libraries.append(library)
 
-    # 8c. pool the libraries of each GEM well and place every nucleus once
-    print("  placing the nuclei (spatial libraries of one GEM well pooled)")
+    # 8c. place every nucleus once per GEM well
     placements = []
     for gem_well in gem_wells:
         mine_libraries = [lib for lib in libraries if lib["gem_well"] == gem_well]
         if not mine_libraries:
             continue
+        if len(mine_libraries) == 1:  # one spatial library: its placement from step 6 is the answer
+            print(f"  {gem_well}: one spatial library, positions taken from {mine_libraries[0]['name']}")
+            coords = mine_libraries[0]["coords"].copy()
+            coords.insert(0, "gem_well", gem_well)
+            coords["spatial_libraries"] = mine_libraries[0]["sb_index"]
+            placements.append(coords)
+            continue
+        print(f"  {gem_well}: {len(mine_libraries)} spatial libraries, pooled and placed again")
         nuclei, _, _ = core.load_nuclei(section, os.path.join(work, "cellranger", gem_well, "barcodes.tsv.gz"), args.barcode_length)
         row_of = {b: i for i, b in enumerate(nuclei["cellranger_barcode"])}
         pooled = []
         for lib in mine_libraries:
-            r = lib["reads"]
+            r = dict(np.load(core.download(f"{lib['source']}/{section}/nucleus_reads.npz",
+                                           os.path.join(work, "lines", lib["name"]))[0]))
             nucleus = np.array([row_of.get(b, -1) for b in r["cellranger_barcode"]])[r["nucleus"]]
             pooled.append(pd.DataFrame({"nucleus": nucleus, "umi": r["umi"], "bead_row": r["bead_row"], "reads": r["reads"]}))
         pooled = pd.concat(pooled)
