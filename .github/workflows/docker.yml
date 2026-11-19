@@ -1,0 +1,31 @@
+# Builds the Docker image and pushes it to Docker Hub as <your Docker Hub user>/slidetags-flex:<version>.
+# Runs when you publish a GitHub release (version = the release tag, e.g. v2.0.0),
+# or by hand: Actions tab -> "Build Docker image" -> Run workflow (you type the version).
+# Needs two repository secrets (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME  your Docker Hub user name
+#   DOCKERHUB_TOKEN     a Docker Hub access token (Docker Hub -> Account settings -> Personal access tokens)
+name: Build Docker image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag, e.g. v2.0.0"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/slidetags-flex:${{ github.event.inputs.version || github.event.release.tag_name }}

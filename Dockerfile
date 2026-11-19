@@ -16,9 +16,11 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends google-cloud-cli \
  && rm -rf /var/lib/apt/lists/*
 
-# scanpy[leiden] brings anndata, umap-learn, igraph and leidenalg
-RUN pip install --no-cache-dir numpy==2.0.2 pandas==2.2.3 scipy==1.14.1 matplotlib==3.9.2 \
-      h5py==3.12.1 "scanpy[leiden]==1.10.4"
+# scanpy and everything it uses, pinned to versions that work together (scanpy 1.10.4 needs
+# scipy < 1.14: newer scipy removed a function scanpy calls for sections > 4,096 nuclei)
+RUN pip install --no-cache-dir numpy==2.0.2 pandas==2.2.3 scipy==1.13.1 matplotlib==3.9.2 \
+      h5py==3.12.1 scanpy==1.10.4 anndata==0.11.1 scikit-learn==1.5.2 umap-learn==0.5.7 \
+      pynndescent==0.5.13 numba==0.60.0 igraph==0.11.8 leidenalg==0.10.2
 
 COPY slidetags_flex.py merge_sections.py report_section.py /opt/
 ENV PYTHONUNBUFFERED=1 PYTHONPATH=/opt NUMBA_CACHE_DIR=/tmp/numba MPLCONFIGDIR=/tmp/matplotlib

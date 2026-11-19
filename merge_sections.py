@@ -148,7 +148,12 @@ def merge_section(section, lines, args):
     cells = pd.concat(cells, ignore_index=True)
     all_genes = rna[gem_wells[0]][2]
     counts = scipy.sparse.vstack([align_genes(m, g, all_genes) for m, _, g in rna.values()]).tocsr()
-    umap, clusters = rna_analysis(counts)
+    try:
+        umap, clusters = rna_analysis(counts)
+        rna_error = ""
+    except Exception as error:  # noqa: BLE001 - without UMAP/clusters the summary is still useful
+        print(f"  RNA clustering failed, continuing without it: {error!r}")
+        umap, clusters, rna_error = np.full((counts.shape[0], 2), np.nan), np.zeros(counts.shape[0], int), repr(error)
     cells["rna_cluster"], cells["umap_1"], cells["umap_2"] = clusters, umap[:, 0], umap[:, 1]
 
     # 8e. one table with every nucleus: RNA + pooled placement
@@ -168,7 +173,7 @@ def merge_section(section, lines, args):
                   "gem_wells": gem_wells, "libraries": libraries, "puck": puck, "puck_path": puck_path,
                   "beads_in_file": beads_in_file,
                   "metrics": metrics, "raw": raw, "cmes": args.cmes, "knn": args.knn,
-                  "mito_measured": bool(cells["pct_mito"].notna().any())}
+                  "mito_measured": bool(cells["pct_mito"].notna().any()), "rna_error": rna_error}
 
 
 def cellranger_dir(line, section):
@@ -329,16 +334,17 @@ def qc_table(merged, libraries, gem_wells):
 def self_test():
     import h5py
     rng = np.random.default_rng(0)
+    # 6,000 nuclei: above 4,096 scanpy finds neighbours another way (approximate), as for real sections
     profiles = rng.gamma(0.3, 1, size=(3, 300))  # 3 cell types, 300 genes
-    counts = scipy.sparse.csr_matrix(rng.poisson(profiles[rng.integers(0, 3, 400)] * 3))
+    counts = scipy.sparse.csr_matrix(rng.poisson(profiles[rng.integers(0, 3, 6000)] * 3))
     umap, clusters = rna_analysis(counts)
-    assert umap.shape == (400, 2) and clusters.min() >= 0 and len(set(clusters)) >= 2, (umap.shape, set(clusters))
+    assert umap.shape == (6000, 2) and clusters.min() >= 0 and len(set(clusters)) >= 2, (umap.shape, set(clusters))
     path = "/tmp/self_test_raw.h5"
     csc = counts.T.tocsc()  # 10x .h5: genes x barcodes, compressed by barcode
     with h5py.File(path, "w") as f:
         g = f.create_group("matrix")
         g["data"], g["indices"], g["indptr"] = csc.data, csc.indices, csc.indptr
-        g["barcodes"] = np.array([f"BC{i}-1".encode() for i in range(400)])
+        g["barcodes"] = np.array([f"BC{i}-1".encode() for i in range(counts.shape[0])])
     totals = raw_barcode_totals(path)
     assert (totals["umis"].to_numpy() == np.asarray(counts.sum(1)).ravel()).all()
     print(f"self-test ok: {len(set(clusters))} clusters, UMAP {umap.shape}, .h5 reader ok")

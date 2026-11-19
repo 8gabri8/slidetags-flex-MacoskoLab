@@ -3,7 +3,6 @@ Two checks of STEP 6 of slidetags_flex.py:
   1. our DBSCAN (dbscan) gives the same clusters as scikit-learn's DBSCAN with sample weights
   2. our directly computed i1 / i2 (one_cluster_range) equal what the R search loops in
      positioning.R (ported line by line below) return, on simulated nuclei
-  3. the one-pass cluster counts (clusters_at_every_min_pts) equal a full DBSCAN at every min_pts
 
 Usage: python tests/test_dbscan.py [umis.csv.gz ...]
 """
@@ -140,23 +139,13 @@ def main(matrices):
         agree_i2 += a2 == b2
         if a2 != b2:
             diffs.append((cell.n, a2, b2, dbscan(cell, a2).max() if a2 else None, dbscan(cell, b2).max()))
-    # 3. the one-pass cluster counts (clusters_at_every_min_pts) equal a full DBSCAN at every min_pts
-    n_counts = ok_counts = 0
-    for x, y, umi in cells:
-        beads = np.column_stack([x, y, umi]).astype(float)
-        if len(beads) == 0:
-            continue
-        for v, k in S.clusters_at_every_min_pts(S.prepare(beads, eps)).items():
-            n_counts += 1
-            ok_counts += S.dbscan(beads, eps, v).max() == k
     n = len(cells)
-    print(f"one-pass cluster counts: {ok_counts}/{n_counts} equal to a full DBSCAN")
     print(f"DBSCAN vs scikit-learn : {n_ok_sk}/{n_sk} identical clusterings")
     print(f"i1 exact vs R search   : {agree_i1}/{n} equal")
     print(f"i2 exact vs R search   : {agree_i2}/{n} equal")
     for d in diffs[:10]:
         print(f"   differs: beads={d[0]} exact i2={d[1]} (clusters {d[3]}) | R i2={d[2]} (clusters {d[4]})")
-    return n_ok_sk == n_sk and agree_i1 == n and ok_counts == n_counts
+    return n_ok_sk == n_sk and agree_i1 == n
 
 
 def _border_only_difference(cell, ours, sk, mp):

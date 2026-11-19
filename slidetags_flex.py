@@ -638,22 +638,13 @@ def place_nuclei(umis, nuclei, puck, knn, cmes, cores):
                     "nuclei placed": placed, "% placed": round(100 * placed / max(len(coords), 1), 2)}
 
 
-def prepare(beads, eps):
-    """What DBSCAN needs that does not depend on min_pts, computed ONCE per nucleus: the beads sorted
-    by UMIs (most first, so cluster 1 is the one found first, as R's dbscan), which beads are within
-    eps of each other, and each bead's 'height' = UMIs within eps of it (itself included)."""
+def dbscan(beads, eps, min_pts):
+    """Cluster number of each bead (0 = background). Beads are sorted by UMIs, so cluster 1 is the
+    one found first starting from the bead with most UMIs (as R's dbscan)."""
     order = np.argsort(-beads[:, 2], kind="stable")
-    ranked = beads[order]
-    neighbours = cKDTree(ranked[:, :2]).query_ball_point(ranked[:, :2], r=eps)
-    heights = np.array([ranked[nb, 2].sum() for nb in neighbours])
-    return order, neighbours, heights
-
-
-def dbscan(beads, eps, min_pts, prepared=None):
-    """Cluster number of each bead (0 = background). A bead is core if its height >= min_pts;
-    clusters grow from core beads through their neighbours."""
-    order, neighbours, heights = prepared if prepared is not None else prepare(beads, eps)
-    core = heights >= min_pts
+    beads = beads[order]
+    neighbours = cKDTree(beads[:, :2]).query_ball_point(beads[:, :2], r=eps)
+    core = np.array([beads[nb, 2].sum() for nb in neighbours]) >= min_pts
     cluster = np.zeros(len(beads), int)
     for start in np.flatnonzero(core):
         if cluster[start]:
@@ -671,42 +662,6 @@ def dbscan(beads, eps, min_pts, prepared=None):
     return result
 
 
-def clusters_at_every_min_pts(prepared):
-    """Number of DBSCAN clusters for EVERY possible min_pts, in one pass (instead of one DBSCAN each).
-
-    The clusters are the groups of core beads linked through neighbours (non-core beads join a
-    cluster but never link two clusters). Lowering min_pts only ever ADDS core beads, in order of
-    height. So: add the beads from the highest down; each new bead is a new group, and joins the
-    groups of its neighbours that are already in. After adding every bead of height >= v, the number
-    of groups = the number of clusters at min_pts = v. Groups are tracked with union-find (each bead
-    points to a bead of its group; 'root' follows the pointers to the group's representative).
-    Same idea as OPTICS/HDBSCAN (all density levels at once). Returns {min_pts: clusters}."""
-    _, neighbours, heights = prepared
-    parent = np.arange(len(heights))
-    added = np.zeros(len(heights), bool)
-
-    def root(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]  # shortcut the path as we go
-            i = parent[i]
-        return i
-
-    groups, clusters = 0, {}
-    by_height = np.argsort(-heights, kind="stable")
-    for k, bead in enumerate(by_height):
-        added[bead] = True
-        groups += 1
-        for nb in neighbours[bead]:
-            if added[nb]:
-                a, b = root(bead), root(nb)
-                if a != b:
-                    parent[b] = a
-                    groups -= 1
-        if k + 1 == len(by_height) or heights[by_height[k + 1]] != heights[bead]:
-            clusters[int(heights[bead])] = groups  # all beads of this height are in
-    return clusters
-
-
 def merge_close(beads, cluster, max_distance):
     """Clusters whose UMI-weighted centre is within max_distance of cluster 1's centre join cluster 1."""
     if cluster.max() < 2 or max_distance <= 0:
@@ -720,20 +675,18 @@ def merge_close(beads, cluster, max_distance):
 
 def one_cluster_range(beads, eps, cmes):
     """i1 = highest min_pts with a cluster; i2 = highest min_pts with 2+ clusters (0 if none).
-    Clusters only change at the beads' heights, so only those values are candidates.
+    Clusters only change at the beads' neighbourhood UMI sums, so only those values are tried.
     With cmes, i2 is lowered while all clusters at i2 lie within eps*cmes of cluster 1."""
     if len(beads) == 0:
         return 0, 0
-    prepared = prepare(beads, eps)
-    clusters = clusters_at_every_min_pts(prepared)  # one pass gives the cluster count of every candidate
-    candidates = sorted(clusters, reverse=True)      # high to low
-    i1 = candidates[0]
-    two_or_more = [v for v in candidates if clusters[v] >= 2]
-    # cmes: a full DBSCAN is only needed where there are 2+ clusters (elsewhere merging cannot give 2)
-    for v in two_or_more:
-        if cmes <= 0 or merge_close(beads, dbscan(beads, eps, v, prepared), eps * cmes).max() >= 2:
-            return i1, v
-    return i1, 0
+    neighbours = cKDTree(beads[:, :2]).query_ball_point(beads[:, :2], r=eps)
+    candidates = np.unique([beads[nb, 2].sum() for nb in neighbours])[::-1]  # high to low
+    i1 = int(candidates[0])
+    i2 = next((int(v) for v in candidates if dbscan(beads, eps, v).max() >= 2), 0)
+    while cmes > 0 and i2 >= 1 and merge_close(beads, dbscan(beads, eps, i2), eps * cmes).max() < 2:
+        lower = candidates[candidates < i2]
+        i2 = int(lower[0]) if len(lower) else 0
+    return i1, i2
 
 
 def final_position(beads, eps, cmes, min_pts, i2, i1=None):
@@ -749,8 +702,7 @@ def final_position(beads, eps, cmes, min_pts, i2, i1=None):
                x_dynamic=np.nan, y_dynamic=np.nan, umi_main=np.nan, umi_second=np.nan)
     if len(beads) == 0:
         return row
-    prepared = prepare(beads, eps)  # neighbours once, for the 3 DBSCANs below
-    cluster = merge_close(beads, dbscan(beads, eps, min_pts, prepared), eps * cmes)
+    cluster = merge_close(beads, dbscan(beads, eps, min_pts), eps * cmes)
     row.update(clusters=int(cluster.max()), umi=int(beads[:, 2].sum()), beads=len(beads))
     for c in (1, 2):
         if cluster.max() >= c:
@@ -767,11 +719,11 @@ def final_position(beads, eps, cmes, min_pts, i2, i1=None):
     if row["clusters"] == 1:
         row.update(x=row["x1"], y=row["y1"], placed=True)
     if i1:
-        at_i1 = dbscan(beads, eps, i1, prepared)
+        at_i1 = dbscan(beads, eps, i1)
         if at_i1.max() == 1:
             inside = beads[at_i1 == 1]
             row["x_dynamic"], row["y_dynamic"] = np.average(inside[:, :2], axis=0, weights=inside[:, 2])
-    at_i2 = merge_close(beads, dbscan(beads, eps, i2, prepared), eps * cmes)
+    at_i2 = merge_close(beads, dbscan(beads, eps, i2), eps * cmes)
     sizes = sorted((beads[at_i2 == c, 2].sum() for c in range(1, at_i2.max() + 1)), reverse=True)
     row["umi_main"] = sizes[0] if sizes else np.nan
     row["umi_second"] = sizes[1] if len(sizes) > 1 else np.nan

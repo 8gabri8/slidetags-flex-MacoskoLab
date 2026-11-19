@@ -258,6 +258,9 @@ def cell_calling(m, fig):
 
 def rna(m, fig):
     c = m["coords"]
+    if m.get("rna_error"):
+        return message(fig.add_subplot(), f"RNA clustering (UMAP, Leiden) failed:\n{m['rna_error'][:300]}\n\n"
+                                          "Everything else in this summary is fine.")
     fig.subplots_adjust(hspace=0.35, wspace=0.25)
     title(fig, "RNA", f"{len(c):,} nuclei, all GEM wells together (no batch correction); scanpy: 2,000 variable genes, PCA, UMAP, Leiden 1.0")
     ax = fig.add_subplot(3, 2, 1)
